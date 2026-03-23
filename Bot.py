@@ -8,7 +8,8 @@ from collections import deque
 # ============================================================
 #  CONFIGURACIÓN — reemplazá con tu token real
 # ============================================================
-API_TOKEN = "pat_26bc4984b660480cc4772265d5a6939e42de6173ca88b011add83591db0976e7"
+import os
+API_TOKEN = os.environ.get("API_TOKEN")
 
 SYMBOLS = ["1HZ25V", "1HZ50V"]   # V25 y V50
 TRADE_AMOUNT = 100                 # USD por operación
