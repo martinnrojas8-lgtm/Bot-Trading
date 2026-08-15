@@ -4,20 +4,20 @@ import json
 import logging
 from datetime import datetime
 from collections import deque
-import os
+import time
 
 # ============================================================
-#  CONFIGURACIÓN - ¡CAMBIÁ ESTO!
+#  CONFIGURACIÓN - CON TU TOKEN
 # ============================================================
-API_TOKEN = os.environ.get("API_TOKEN", "TU_TOKEN_AQUI")  # ← PON TU TOKEN
+API_TOKEN = "pat_0ec2c262d0b9a9aebc1442252eb807b61d128b236a40248be7ef927446b0a357"
 SYMBOLS = ["R_100", "R_75"]  # Índices sintéticos de Deriv
 TRADE_AMOUNT = 10  # USD por operación (empezá con poco)
 CONTRACT_DURATION = 1  # 1 minuto
 EMA_SHORT = 9
 EMA_MEDIUM = 20
 EMA_LONG = 50
-MIN_VELAS_SEPARADAS = 15  # minutos sin cruces
-DERIV_WS = "wss://ws.binaryws.com/websockets/v3?app_id=1089"
+MIN_VELAS_SIN_CRUCES = 15  # minutos sin cruces
+DERIV_WS = "wss://ws.binaryws.com/websockets/v3?app_id=1089"  # Demo
 
 # ============================================================
 #  LOGGING
@@ -68,44 +68,37 @@ def detectar_senal(velas: list) -> str | None:
     ema20_series = calcular_ema(cierres, EMA_MEDIUM)
     ema50_series = calcular_ema(cierres, EMA_LONG)
     
-    if len(ema9_series) < MIN_VELAS_SEPARADAS + 2:
+    if len(ema9_series) < MIN_VELAS_SIN_CRUCES + 2:
         return None
     
-    # EMAs actuales y previas
+    # EMAs actuales
     ema9 = ema9_series[-1]
     ema20 = ema20_series[-1]
     ema50 = ema50_series[-1]
     
-    # 1. VERIFICAR ORDEN Y SEPARACIÓN DE EMAs
+    # 1. VERIFICAR ORDEN DE EMAs
     orden_alcista = ema9 > ema20 > ema50
     orden_bajista = ema9 < ema20 < ema50
     
     if not orden_alcista and not orden_bajista:
-        log.debug("❌ EMAs desordenadas o cruzadas")
         return None
     
     # 2. VERIFICAR QUE NO HAYA CRUCES EN ÚLTIMOS 15 MINUTOS
-    ema9_ultimas = ema9_series[-MIN_VELAS_SEPARADAS:]
-    ema20_ultimas = ema20_series[-MIN_VELAS_SEPARADAS:]
-    ema50_ultimas = ema50_series[-MIN_VELAS_SEPARADAS:]
-    
     if orden_alcista:
-        # Verificar que ninguna EMA se cruce en el período
-        for i in range(len(ema9_ultimas) - 1):
-            if not (ema9_ultimas[i] > ema20_ultimas[i] > ema50_ultimas[i]):
-                log.debug("❌ Cruce detectado en últimos 15 min")
+        for i in range(MIN_VELAS_SIN_CRUCES):
+            if not (ema9_series[-i-1] > ema20_series[-i-1] > ema50_series[-i-1]):
                 return None
-    else:  # bajista
-        for i in range(len(ema9_ultimas) - 1):
-            if not (ema9_ultimas[i] < ema20_ultimas[i] < ema50_ultimas[i]):
-                log.debug("❌ Cruce detectado en últimos 15 min")
+    else:
+        for i in range(MIN_VELAS_SIN_CRUCES):
+            if not (ema9_series[-i-1] < ema20_series[-i-1] < ema50_series[-i-1]):
                 return None
     
     # 3. ANALIZAR RETROCESO + CONFIRMACIÓN (últimas 2 velas)
+    if len(velas) < 2:
+        return None
+    
     vela_retroceso = velas[-2]
     vela_confirmacion = velas[-1]
-    
-    # Obtener EMA9 de la vela de retroceso
     ema9_retroceso = ema9_series[-2]
     
     if orden_alcista:
@@ -123,9 +116,6 @@ def detectar_senal(velas: list) -> str | None:
         )
         
         if es_retroceso and es_confirmacion:
-            log.info(f"🎯 SEÑAL CALL detectada!")
-            log.info(f"   Retroceso: {vela_retroceso['close']:.5f} | EMA9: {ema9_retroceso:.5f}")
-            log.info(f"   Confirmación: {vela_confirmacion['close']:.5f} > {vela_retroceso['close']:.5f}")
             return "CALL"
     
     else:  # orden_bajista
@@ -143,9 +133,6 @@ def detectar_senal(velas: list) -> str | None:
         )
         
         if es_retroceso and es_confirmacion:
-            log.info(f"🎯 SEÑAL PUT detectada!")
-            log.info(f"   Retroceso: {vela_retroceso['close']:.5f} | EMA9: {ema9_retroceso:.5f}")
-            log.info(f"   Confirmación: {vela_confirmacion['close']:.5f} < {vela_retroceso['close']:.5f}")
             return "PUT"
     
     return None
@@ -159,8 +146,9 @@ class DerivBot:
         self.velas = {sym: deque(maxlen=200) for sym in SYMBOLS}
         self.operaciones_abiertas = set()
         self.stats = {"ganadas": 0, "perdidas": 0, "total": 0, "profit": 0}
-        self.ultima_operacion = {}  # para evitar duplicados
+        self.ultima_operacion = {}
         self.conectado = False
+        self.en_operacion = False
 
     async def conectar(self):
         """Conexión principal con reconexión automática"""
@@ -185,7 +173,10 @@ class DerivBot:
 
     async def enviar(self, datos: dict):
         """Envía mensaje al WebSocket"""
-        await self.ws.send(json.dumps(datos))
+        try:
+            await self.ws.send(json.dumps(datos))
+        except Exception as e:
+            log.error(f"Error al enviar: {e}")
 
     async def autenticar(self):
         """Autenticación con API token"""
@@ -218,8 +209,8 @@ class DerivBot:
             
             # Suscribirse a actualizaciones en tiempo real
             await self.enviar({
-                "subscribe": 1,
-                "ticks": symbol
+                "ticks": symbol,
+                "subscribe": 1
             })
             log.info(f"📊 Suscrito a {symbol} (1min)")
 
@@ -253,126 +244,149 @@ class DerivBot:
 
     async def procesar_historial(self, datos: dict):
         """Procesa historial de velas"""
-        symbol = datos["echo_req"]["ticks_history"]
-        velas_raw = datos.get("candles", [])
-        
-        for v in velas_raw:
-            self.velas[symbol].append({
-                "open": float(v["open"]),
-                "high": float(v["high"]),
-                "low": float(v["low"]),
-                "close": float(v["close"]),
-                "epoch": v["epoch"]
-            })
-        
-        log.info(f"📥 {symbol}: {len(self.velas[symbol])} velas cargadas")
+        try:
+            symbol = datos["echo_req"]["ticks_history"]
+            velas_raw = datos.get("candles", [])
+            
+            for v in velas_raw:
+                self.velas[symbol].append({
+                    "open": float(v["open"]),
+                    "high": float(v["high"]),
+                    "low": float(v["low"]),
+                    "close": float(v["close"]),
+                    "epoch": v["epoch"]
+                })
+            
+            log.info(f"📥 {symbol}: {len(self.velas[symbol])} velas cargadas")
+        except Exception as e:
+            log.error(f"Error procesando historial: {e}")
 
     async def procesar_vela_nueva(self, datos: dict):
         """Procesa nueva vela (1 minuto)"""
-        ohlc = datos.get("ohlc", {})
-        symbol = ohlc.get("symbol")
-        
-        if not symbol or symbol not in SYMBOLS:
-            return
-        
-        vela = {
-            "open": float(ohlc["open"]),
-            "high": float(ohlc["high"]),
-            "low": float(ohlc["low"]),
-            "close": float(ohlc["close"]),
-            "epoch": ohlc["epoch"]
-        }
-        
-        # Actualizar o agregar vela
-        if self.velas[symbol] and self.velas[symbol][-1]["epoch"] == vela["epoch"]:
-            self.velas[symbol][-1] = vela  # actualizar vela en curso
-        else:
-            self.velas[symbol].append(vela)  # nueva vela cerrada
-            await self.analizar(symbol)
+        try:
+            ohlc = datos.get("ohlc", {})
+            symbol = ohlc.get("symbol")
+            
+            if not symbol or symbol not in SYMBOLS:
+                return
+            
+            vela = {
+                "open": float(ohlc["open"]),
+                "high": float(ohlc["high"]),
+                "low": float(ohlc["low"]),
+                "close": float(ohlc["close"]),
+                "epoch": ohlc["epoch"]
+            }
+            
+            # Actualizar o agregar vela
+            if self.velas[symbol] and self.velas[symbol][-1]["epoch"] == vela["epoch"]:
+                self.velas[symbol][-1] = vela
+            else:
+                self.velas[symbol].append(vela)
+                await self.analizar(symbol)
+        except Exception as e:
+            log.error(f"Error procesando vela nueva: {e}")
 
     async def analizar(self, symbol: str):
         """Analiza señal y ejecuta operación"""
-        # Evitar operaciones duplicadas
-        if symbol in self.operaciones_abiertas:
-            return
-        
-        # Evitar operar en la misma vela de confirmación
-        if symbol in self.ultima_operacion:
-            tiempo_ultima = self.ultima_operacion[symbol]
-            if (datetime.now() - tiempo_ultima).seconds < 30:
+        try:
+            # Evitar operaciones duplicadas
+            if symbol in self.operaciones_abiertas:
                 return
-        
-        velas = list(self.velas[symbol])
-        senal = detectar_senal(velas)
-        
-        if senal:
-            log.info(f"🚀 EJECUTANDO {senal} en {symbol}")
-            await self.operar(symbol, senal)
-            self.ultima_operacion[symbol] = datetime.now()
+            
+            # Evitar operar muy seguido
+            if symbol in self.ultima_operacion:
+                tiempo_ultima = self.ultima_operacion[symbol]
+                if (datetime.now() - tiempo_ultima).seconds < 60:
+                    return
+            
+            velas = list(self.velas[symbol])
+            senal = detectar_senal(velas)
+            
+            if senal:
+                log.info(f"🚀 SEÑAL DETECTADA: {senal} en {symbol}")
+                await self.operar(symbol, senal)
+                self.ultima_operacion[symbol] = datetime.now()
+        except Exception as e:
+            log.error(f"Error en análisis: {e}")
 
     async def operar(self, symbol: str, direccion: str):
         """Ejecuta la operación en Deriv"""
-        contract_type = "CALL" if direccion == "CALL" else "PUT"
-        self.operaciones_abiertas.add(symbol)
-        
-        await self.enviar({
-            "buy": 1,
-            "price": TRADE_AMOUNT,
-            "parameters": {
-                "contract_type": contract_type,
-                "symbol": symbol,
-                "duration": CONTRACT_DURATION,
-                "duration_unit": "m",
-                "basis": "stake",
-                "currency": "USD",
-            },
-            "subscribe": 1
-        })
-        
-        log.info(f"📤 Orden enviada: {symbol} | {contract_type} | ${TRADE_AMOUNT}")
+        try:
+            contract_type = "CALL" if direccion == "CALL" else "PUT"
+            self.operaciones_abiertas.add(symbol)
+            self.en_operacion = True
+            
+            await self.enviar({
+                "buy": 1,
+                "price": TRADE_AMOUNT,
+                "parameters": {
+                    "contract_type": contract_type,
+                    "symbol": symbol,
+                    "duration": CONTRACT_DURATION,
+                    "duration_unit": "m",
+                    "basis": "stake",
+                    "currency": "USD",
+                },
+                "subscribe": 1
+            })
+            
+            log.info(f"📤 Orden enviada: {symbol} | {contract_type} | ${TRADE_AMOUNT}")
+        except Exception as e:
+            log.error(f"Error al operar: {e}")
+            self.operaciones_abiertas.discard(symbol)
+            self.en_operacion = False
 
     def procesar_compra(self, datos: dict):
         """Procesa confirmación de compra"""
-        if "error" in datos:
-            symbol = datos.get("echo_req", {}).get("parameters", {}).get("symbol", "?")
-            log.error(f"❌ Error al comprar {symbol}: {datos['error']['message']}")
-            self.operaciones_abiertas.discard(symbol)
-            return
-        
-        compra = datos.get("buy", {})
-        log.info(f"✅ Contrato abierto | ID: {compra.get('contract_id')}")
+        try:
+            if "error" in datos:
+                symbol = datos.get("echo_req", {}).get("parameters", {}).get("symbol", "?")
+                log.error(f"❌ Error al comprar {symbol}: {datos['error']['message']}")
+                self.operaciones_abiertas.discard(symbol)
+                self.en_operacion = False
+                return
+            
+            compra = datos.get("buy", {})
+            log.info(f"✅ Contrato abierto | ID: {compra.get('contract_id')}")
+        except Exception as e:
+            log.error(f"Error procesando compra: {e}")
 
     async def procesar_resultado(self, datos: dict):
         """Procesa resultado de la operación"""
-        contrato = datos.get("proposal_open_contract", {})
-        if not contrato.get("is_expired") and not contrato.get("is_sold"):
-            return
-        
-        symbol = contrato.get("underlying")
-        profit = float(contrato.get("profit", 0))
-        
-        # Actualizar estadísticas
-        self.stats["total"] += 1
-        self.stats["profit"] += profit
-        
-        if profit > 0:
-            self.stats["ganadas"] += 1
-            resultado = "✅ GANADA"
-        else:
-            self.stats["perdidas"] += 1
-            resultado = "❌ PERDIDA"
-        
-        winrate = (self.stats["ganadas"] / self.stats["total"] * 100) if self.stats["total"] > 0 else 0
-        
-        log.info(f"{'='*50}")
-        log.info(f"  {resultado}")
-        log.info(f"  Activo: {symbol}")
-        log.info(f"  P&L: {'+' if profit > 0 else ''}{profit:.2f} USD")
-        log.info(f"  Balance: {self.stats['profit']:.2f} USD")
-        log.info(f"  Stats: {self.stats['ganadas']}W / {self.stats['perdidas']}L | {winrate:.1f}%")
-        log.info(f"{'='*50}")
-        
-        self.operaciones_abiertas.discard(symbol)
+        try:
+            contrato = datos.get("proposal_open_contract", {})
+            if not contrato.get("is_expired") and not contrato.get("is_sold"):
+                return
+            
+            symbol = contrato.get("underlying")
+            profit = float(contrato.get("profit", 0))
+            
+            # Actualizar estadísticas
+            self.stats["total"] += 1
+            self.stats["profit"] += profit
+            
+            if profit > 0:
+                self.stats["ganadas"] += 1
+                resultado = "✅ GANADA"
+            else:
+                self.stats["perdidas"] += 1
+                resultado = "❌ PERDIDA"
+            
+            winrate = (self.stats["ganadas"] / self.stats["total"] * 100) if self.stats["total"] > 0 else 0
+            
+            log.info(f"{'='*50}")
+            log.info(f"  {resultado}")
+            log.info(f"  Activo: {symbol}")
+            log.info(f"  P&L: {'+' if profit > 0 else ''}{profit:.2f} USD")
+            log.info(f"  Balance total: {self.stats['profit']:.2f} USD")
+            log.info(f"  Stats: {self.stats['ganadas']}W / {self.stats['perdidas']}L | {winrate:.1f}%")
+            log.info(f"{'='*50}")
+            
+            self.operaciones_abiertas.discard(symbol)
+            self.en_operacion = False
+        except Exception as e:
+            log.error(f"Error procesando resultado: {e}")
 
 # ============================================================
 #  EJECUCIÓN
